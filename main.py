@@ -396,24 +396,33 @@ if __name__ == '__main__':
 @app.route('/' + BOT_TOKEN, methods=['POST'])
 def webhook():
     if request.headers.get('content-type') == 'application/json':
-        json_string = request.get_data().as_text()
+        json_string = request.get_data(as_text=True)  # ИСПРАВЛЕНО
         update = telebot.types.Update.de_json(json_string)
-        bot.process_new_updates([update])
-        return ''
-    abort(403)
+        if update:
+            bot.process_new_updates([update])
+        return '', 200
+    else:
+        abort(403)
 
 @app.route('/')
 def index():
     return 'Bot is running!'
 
-# Функция для установки webhook (вызывается при старте)
 def set_webhook():
-    bot.remove_webhook()  # Очистка старого
-    bot.set_webhook(url=f"https://{os.environ.get('RENDER_EXTERNAL_HOSTNAME')}/{BOT_TOKEN}")
+    bot.remove_webhook()
+    # Render даёт переменную RENDER_EXTERNAL_URL или RENDER_EXTERNAL_HOSTNAME
+    url = os.environ.get('RENDER_EXTERNAL_URL')
+    if not url:
+        # Если не задано — используем hostname (Render ставит автоматически)
+        hostname = os.environ.get('RENDER_EXTERNAL_HOSTNAME')
+        if hostname:
+            url = f"https://{hostname}"
+    if url:
+        bot.set_webhook(url=f"{url}/{BOT_TOKEN}")
+    else:
+        print("Не удалось установить webhook — нет URL от Render")
 
 if __name__ == '__main__':
-    # На Render используй порт из env
-    import os
-    set_webhook()  # Устанавливаем webhook при запуске
+    set_webhook()  # Устанавливаем webhook при старте
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=port, debug=False)
