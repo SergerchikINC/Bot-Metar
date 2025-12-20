@@ -9,6 +9,7 @@ from telebot.types import Message, CallbackQuery
 import pymongo  # Для MongoDB - pip install pymongo
 from flask import Flask, request, abort
 import threading
+import os
 
 # Токен вашего Telegram-бота (замените на реальный)
 BOT_TOKEN = '7947527517:AAFfeVZot_s9Zdd-H8QDuVFVGnE6itM4Rlw'
