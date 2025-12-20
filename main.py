@@ -12,8 +12,8 @@ import os
 from flask import Flask, request, abort
 
 # Токен бота и MongoDB URI (на Render берутся из env variables)
-BOT_TOKEN = 'BOT_TOKEN'
-MONGODB_URI = 'mongodb://localhost:27017/'
+BOT_TOKEN = '7947527517:AAFfeVZot_s9Zdd-H8QDuVFVGnE6itM4Rlw'
+MONGODB_URI = 'mongodb+srv://Ger1k:Sergerchik_Men847@cluster0.4u1ctex.mongodb.net/?appName=Cluster0'
 
 # Подключение к MongoDB
 client = pymongo.MongoClient(MONGODB_URI)
