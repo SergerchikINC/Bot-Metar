@@ -1,5 +1,3 @@
-
-
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import telebot
 import requests
@@ -10,7 +8,7 @@ import pymongo
 import os
 
 # Токен и MongoDB (для Render берём из env)
-BOT_TOKEN = 'BOT_TOKEN'
+BOT_TOKEN = '7947527517:AAFfeVZot_s9Zdd-H8QDuVFVGnE6itM4Rlw'
 MONGODB_URI = 'mongodb+srv://Ger1k:Sergerchik_Men847@cluster0.4u1ctex.mongodb.net/?appName=Cluster0'
 client = pymongo.MongoClient(MONGODB_URI)
 db = client['bot_db']
