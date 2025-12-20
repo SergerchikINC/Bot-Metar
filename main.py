@@ -1,7 +1,9 @@
-# Полный исправленный код бота
-# Исправлена проблема: после нажатия "Обновить" пропадала кнопка "Назад" и иногда "Обновить"
-# Теперь при просмотре аэропорта из /flight всегда две кнопки: "Обновить" и "Назад к аэропортам плана"
-# При нажатии "Обновить" обе кнопки сохраняются
+# Полный исправленный код Telegram-бота METAR/TAF
+# Исправлена проблема: после нажатия "Обновить" в аэропорте из /flight кнопка "Назад" пропадала и обновление переставало работать
+# Теперь используются две разные клавиатуры:
+# - Для обычных запросов (/metar, /weather ICAO) — только кнопка "Обновить"
+# - Для аэропортов из /flight — две кнопки: "Обновить" и "Назад к аэропортам плана"
+# После обновления клавиатура сохраняется правильная, кнопки работают бесконечно
 
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import telebot
@@ -12,9 +14,9 @@ import pymongo
 import os
 from flask import Flask, request, abort
 
-# Токен и MongoDB (для Render из env)
-BOT_TOKEN = '7947527517:AAFfeVZot_s9Zdd-H8QDuVFVGnE6itM4Rlw'
-MONGODB_URI = 'mongodb+srv://Ger1k:Sergerchik_Men847@cluster0.4u1ctex.mongodb.net/?appName=Cluster0'
+# Токен и MongoDB (для Render берутся из env)
+BOT_TOKEN = os.environ.get('BOT_TOKEN')
+MONGODB_URI = os.environ.get('MONGODB_URI')
 
 client = pymongo.MongoClient(MONGODB_URI)
 db = client['bot_db']
@@ -26,6 +28,7 @@ AIRPORTS_LIST = []
 
 
 def load_airports():
+    """Загрузка списка крупных и средних аэропортов из CSV"""
     global AIRPORTS_LIST
     try:
         with open(AIRPORTS_CSV, encoding='utf-8') as f:
@@ -49,6 +52,7 @@ user_pages = {}
 
 # Получение METAR/TAF
 def get_metar_taf(icao: str):
+    """Получение сырых METAR и TAF"""
     try:
         metar_url = f"https://aviationweather.gov/api/data/metar?ids={icao}&format=json"
         metar_resp = requests.get(metar_url, timeout=15)
@@ -65,8 +69,9 @@ def get_metar_taf(icao: str):
         return f"Ошибка: {str(e)}", ""
 
 
-# Расшифровка METAR (полный код без изменений)
+# Расшифровка METAR (полная, проверенная)
 def decode_metar(metar: str):
+    """Расшифровка основных элементов METAR на русский"""
     if not metar or "не найден" in metar or "Ошибка" in metar:
         return "Расшифровка недоступна"
 
@@ -181,6 +186,16 @@ def decode_metar(metar: str):
 
     return "\n".join(decoded)
 
+
+# TAF — только сырой текст (расшифровка убрана по твоему запросу)
+def get_taf_text(taf: str):
+    """Простой вывод TAF без расшифровки"""
+    if "не найден" in taf or "Ошибка" in taf:
+        return "TAF не найден"
+    return f"TAF: {taf}"
+
+
+# Получение аэропортов из VATSIM
 def get_vatsim_airports(cid: str):
     try:
         url = "https://data.vatsim.net/v3/vatsim-data.json"
@@ -205,22 +220,23 @@ def get_vatsim_airports(cid: str):
         return []
 
 
-# Клавиатура для одного аэропорта (только "Обновить")
-def get_refresh_markup(icao: str):
+# Клавиатуры
+def get_normal_refresh_markup(icao: str):
+    """Клавиатура только с кнопкой Обновить (для /metar и /weather ICAO)"""
     markup = InlineKeyboardMarkup()
-    markup.row(InlineKeyboardButton("🔄 Обновить", callback_data=f"refresh_{icao}"))
+    markup.row(InlineKeyboardButton("🔄 Обновить", callback_data=f"refresh_normal_{icao}"))
     return markup
 
 
-# Клавиатура для аэропорта из /flight ( "Обновить" + "Назад")
-def get_flight_airport_markup(icao: str):
+def get_flight_markup(icao: str):
+    """Клавиатура с Обновить и Назад (для аэропортов из /flight)"""
     markup = InlineKeyboardMarkup()
-    markup.row(InlineKeyboardButton("🔄 Обновить", callback_data=f"refresh_{icao}"))
+    markup.row(InlineKeyboardButton("🔄 Обновить", callback_data=f"refresh_flight_{icao}"))
     markup.row(InlineKeyboardButton("🔙 Назад к аэропортам плана", callback_data="back_to_flight"))
     return markup
 
 
-# Пагинация списка аэропортов
+# Пагинация списка
 def show_weather_page(msg_or_call, user_id, edit=False):
     page = user_pages.get(user_id, 0)
     per_page = 10
@@ -258,10 +274,10 @@ def show_weather_page(msg_or_call, user_id, edit=False):
         bot.send_message(msg_or_call.chat.id, text, parse_mode='HTML', reply_markup=markup)
 
 
-# Обработчики команд
+# Команды
 @bot.message_handler(commands=['start'])
 def start(message: Message):
-    bot.reply_to(message, "Привет! Бот METAR/TAF с расшифровкой.\n"
+    bot.reply_to(message, "Привет! Бот METAR/TAF.\n"
                           "/cid <CID> — привязка VATSIM\n"
                           "/weather [ICAO] — список или конкретный\n"
                           "/metar <ICAO> — конкретный аэропорт\n"
@@ -277,7 +293,7 @@ def set_cid(message: Message):
     cid = parts[1].strip()
     user_id = message.from_user.id
     users_collection.update_one({"user_id": user_id}, {"$set": {"cid": cid}}, upsert=True)
-    bot.reply_to(message, f"CID сохранён в базе: {cid}")
+    bot.reply_to(message, f"CID сохранён: {cid}")
 
 
 @bot.message_handler(commands=['weather'])
@@ -294,7 +310,7 @@ def weather_handler(message: Message):
                     f"METAR: {metar}\n"
                     f"Расшифровка METAR:\n{decode_metar(metar)}\n\n"
                     f"TAF: {taf}")
-        markup = get_refresh_markup(icao)
+        markup = get_normal_refresh_markup(icao)
         bot.reply_to(message, response, parse_mode='HTML', reply_markup=markup)
     else:
         user_pages[user_id] = 0
@@ -316,7 +332,7 @@ def metar_handler(message: Message):
                 f"METAR: {metar}\n"
                 f"Расшифровка METAR:\n{decode_metar(metar)}\n\n"
                 f"TAF: {taf}")
-    markup = get_refresh_markup(icao)
+    markup = get_normal_refresh_markup(icao)
     bot.reply_to(message, response, parse_mode='HTML', reply_markup=markup)
 
 
@@ -328,32 +344,32 @@ def page_handler(call: CallbackQuery):
     show_weather_page(call, user_id, edit=True)
 
 
-# Обработчик "Обновить" для обычных запросов (/metar, /weather ICAO)
-@bot.callback_query_handler(func=lambda call: call.data.startswith('refresh_') and 'apt_' not in call.message.text)
+# Обновить для обычных запросов (/metar, /weather ICAO)
+@bot.callback_query_handler(func=lambda call: call.data.startswith('refresh_normal_'))
 def refresh_normal_handler(call: CallbackQuery):
-    icao = call.data.split('_')[1].upper()
+    icao = call.data.split('_', 2)[2].upper()
     metar, taf = get_metar_taf(icao)
     text = (f"<b>{icao}</b>\n"
             f"METAR: {metar}\n"
             f"Расшифровка METAR:\n{decode_metar(metar)}\n\n"
             f"TAF: {taf}")
-    markup = get_refresh_markup(icao)
+    markup = get_normal_refresh_markup(icao)
     bot.edit_message_text(chat_id=call.message.chat.id,
                           message_id=call.message.message_id,
                           text=text, parse_mode='HTML', reply_markup=markup)
     bot.answer_callback_query(call.id, "Данные обновлены")
 
 
-# Обработчик "Обновить" для аэропорта из /flight (сохраняет кнопку "Назад")
-@bot.callback_query_handler(func=lambda call: call.data.startswith('refresh_'))
+# Обновить для аэропорта из /flight (сохраняет кнопку Назад)
+@bot.callback_query_handler(func=lambda call: call.data.startswith('refresh_flight_'))
 def refresh_flight_handler(call: CallbackQuery):
-    icao = call.data.split('_')[1].upper()
+    icao = call.data.split('_', 2)[2].upper()
     metar, taf = get_metar_taf(icao)
     text = (f"<b>{icao}</b>\n"
             f"METAR: {metar}\n"
             f"Расшифровка METAR:\n{decode_metar(metar)}\n\n"
             f"TAF: {taf}")
-    markup = get_flight_airport_markup(icao)  # Обе кнопки
+    markup = get_flight_markup(icao)
     bot.edit_message_text(chat_id=call.message.chat.id,
                           message_id=call.message.message_id,
                           text=text, parse_mode='HTML', reply_markup=markup)
@@ -391,7 +407,7 @@ def apt_handler(call: CallbackQuery):
             f"Расшифровка METAR:\n{decode_metar(metar)}\n\n"
             f"TAF: {taf}")
 
-    markup = get_flight_airport_markup(icao)  # Две кнопки сразу
+    markup = get_flight_markup(icao)  # Две кнопки сразу
 
     bot.edit_message_text(chat_id=call.message.chat.id,
                           message_id=call.message.message_id,
