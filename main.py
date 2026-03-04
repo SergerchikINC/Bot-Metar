@@ -22,6 +22,10 @@ BOT_TOKEN = os.environ.get('BOT_TOKEN')
 MONGODB_URI = os.environ.get('MONGODB_URI')
 GROQ_API_KEY = os.environ.get('GROQ_API_KEY')
 
+'''BOT_TOKEN = '7947527517:AAFfeVZot_s9Zdd-H8QDuVFVGnE6itM4Rlw'
+MONGODB_URI = 'mongodb+srv://Ger1k:Sergerchik_Men847@cluster0.4u1ctex.mongodb.net/?appName=Cluster0'
+GROQ_API_KEY = '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' '''
+
 if not BOT_TOKEN or not MONGODB_URI or not GROQ_API_KEY:
     raise ValueError("Не все переменные окружения установлены! BOT_TOKEN, MONGODB_URI, GROQ_API_KEY")
 
@@ -124,6 +128,213 @@ def recognize_voice(file_id):
     except Exception as e:
         logging.error(f"Ошибка распознавания голоса: {e}")
         return None
+
+@bot.message_handler(commands=['start'])
+def start(message: Message):
+    bot.reply_to(message, "Привет! Я бот METAR/TAF.\n"
+                          "Пиши просто текстом или отправляй голосовое:\n"
+                          "• Погода в Пулково\n"
+                          "• METAR LED\n"
+                          "• Что в Шереметьево\n\n"
+                          "Команды:\n"
+                          "/cid <CID> — привязка VATSIM\n"
+                          "/flight — аэропорты из плана\n"
+                          "/metar <ICAO> — конкретный аэропорт\n"
+                          "/weather [ICAO] — список или конкретный")
+
+
+@bot.message_handler(commands=['cid'])
+def set_cid(message: Message):
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        bot.reply_to(message, "Использование: /cid 123456")
+        return
+
+    cid = parts[1].strip()
+    user_id = message.from_user.id
+
+    users_collection.update_one(
+        {"user_id": user_id},
+        {"$set": {"cid": cid}},
+        upsert=True
+    )
+
+    bot.reply_to(message, f"VATSIM CID сохранён: {cid}")
+
+
+@bot.message_handler(commands=['metar'])
+def metar_handler(message: Message):
+    parts = message.text.split()
+    if len(parts) < 2:
+        bot.reply_to(message, "Использование: /metar UUEE")
+        return
+
+    icao = parts[1].upper()
+    if len(icao) != 4:
+        bot.reply_to(message, "ICAO должен быть 4 буквы")
+        return
+
+    metar, taf = get_metar_taf(icao)
+
+    txt = (f"<b>{icao}</b>\n"
+           f"METAR: {metar}\n"
+           f"Расшифровка METAR:\n{decode_metar(metar)}")
+
+    markup = get_normal_refresh_markup(icao)
+
+    sent = bot.reply_to(message, txt, parse_mode='HTML', reply_markup=markup)
+    last_data[sent.message_id] = metar + taf
+
+
+@bot.message_handler(commands=['weather'])
+def weather_handler(message: Message):
+    parts = message.text.split()
+    user_id = message.from_user.id
+
+    if len(parts) >= 2:
+        icao = parts[1].upper()
+        if len(icao) != 4:
+            bot.reply_to(message, "ICAO должен быть 4 символа")
+            return
+
+        metar, taf = get_metar_taf(icao)
+
+        txt = (f"<b>{icao}</b>\n"
+               f"METAR: {metar}\n"
+               f"Расшифровка METAR:\n{decode_metar(metar)}\n\n"
+               f"{get_taf_text(taf)}")
+
+        markup = get_normal_refresh_markup(icao)
+
+        sent = bot.reply_to(message, txt, parse_mode='HTML', reply_markup=markup)
+        last_data[sent.message_id] = metar + taf
+
+    else:
+        # Без ICAO — показываем пагинацию
+        user_pages[user_id] = 0
+        show_weather_page(message, user_id)
+
+
+@bot.message_handler(commands=['flight'])
+def flight_handler(message: Message):
+    user_id = message.from_user.id
+    user_doc = users_collection.find_one({"user_id": user_id})
+    cid = user_doc.get("cid") if user_doc else None
+
+    if not cid:
+        bot.reply_to(message, "Сначала выполните /cid <ваш_CID>")
+        return
+
+    airports = get_vatsim_airports(cid)
+    if not airports:
+        bot.reply_to(message, "План полёта не найден или вы не онлайн на VATSIM")
+        return
+
+    markup = InlineKeyboardMarkup()
+    row = []
+    for ap in airports[:2]:  # показываем максимум 2 кнопки
+        row.append(InlineKeyboardButton(ap, callback_data=f"apt_{ap}"))
+    markup.row(*row)
+
+    bot.reply_to(message, f"Аэропорты из вашего плана VATSIM (CID {cid}):", reply_markup=markup)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('apt_'))
+def apt_handler(call: CallbackQuery):
+    icao = call.data[len('apt_'):].upper()
+
+    metar, taf = get_metar_taf(icao)
+
+    text = (f"<b>{icao}</b>\n"
+            f"METAR: {metar}\n"
+            f"Расшифровка METAR:\n{decode_metar(metar)}\n\n"
+            f"{get_taf_text(taf)}")
+
+    markup = get_flight_markup(icao)
+
+    bot.edit_message_text(
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        text=text,
+        parse_mode='HTML',
+        reply_markup=markup
+    )
+
+    last_data[call.message.message_id] = metar + taf
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "back_to_flight")
+def back_to_flight_handler(call: CallbackQuery):
+    user_id = call.from_user.id
+    user_doc = users_collection.find_one({"user_id": user_id})
+    cid = user_doc.get("cid") if user_doc else None
+
+    if not cid:
+        bot.answer_callback_query(call.id, "CID не установлен")
+        return
+
+    airports = get_vatsim_airports(cid)
+    if not airports:
+        bot.answer_callback_query(call.id, "План полёта не найден")
+        return
+
+    text = f"Аэропорты из вашего плана VATSIM (CID {cid}):"
+    markup = InlineKeyboardMarkup()
+    row = []
+    for ap in airports[:2]:
+        row.append(InlineKeyboardButton(ap, callback_data=f"apt_{ap}"))
+    markup.row(*row)
+
+    bot.edit_message_text(
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        text=text,
+        parse_mode='HTML',
+        reply_markup=markup
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('page_'))
+def page_handler(call: CallbackQuery):
+    user_id = call.from_user.id
+    new_page = int(call.data.split('_')[1])
+    user_pages[user_id] = new_page
+    show_weather_page(call, user_id, edit=True)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('refresh_'))
+def refresh_handler(call: CallbackQuery):
+    prefix = 'refresh_normal_' if call.data.startswith('refresh_normal_') else 'refresh_flight_'
+    icao = call.data[len(prefix):].upper()
+    from_flight = prefix == 'refresh_flight_'
+
+    metar, taf = get_metar_taf(icao)
+    new_data = metar + taf
+
+    message_id = call.message.message_id
+    previous_data = last_data.get(message_id)
+
+    if previous_data == new_data:
+        bot.answer_callback_query(call.id, "Данные и так актуальны", show_alert=False)
+        return
+
+    text = (f"<b>{icao}</b>\n"
+            f"METAR: {metar}\n"
+            f"Расшифровка METAR:\n{decode_metar(metar)}\n\n"
+            f"{get_taf_text(taf)}")
+
+    markup = get_flight_markup(icao) if from_flight else get_normal_refresh_markup(icao)
+
+    bot.edit_message_text(
+        chat_id=call.message.chat.id,
+        message_id=message_id,
+        text=text,
+        parse_mode='HTML',
+        reply_markup=markup
+    )
+
+    last_data[message_id] = new_data
+    bot.answer_callback_query(call.id, "Данные обновлены!")
 
 
 @bot.message_handler(content_types=['text', 'voice'])
@@ -509,214 +720,6 @@ def get_vatsim_airports(cid: str):
         return []
     except Exception:
         return []
-
-
-@bot.message_handler(commands=['start'])
-def start(message: Message):
-    bot.reply_to(message, "Привет! Я бот METAR/TAF.\n"
-                          "Пиши просто текстом или отправляй голосовое:\n"
-                          "• Погода в Пулково\n"
-                          "• METAR LED\n"
-                          "• Что в Шереметьево\n\n"
-                          "Команды:\n"
-                          "/cid <CID> — привязка VATSIM\n"
-                          "/flight — аэропорты из плана\n"
-                          "/metar <ICAO> — конкретный аэропорт\n"
-                          "/weather [ICAO] — список или конкретный")
-
-
-@bot.message_handler(commands=['cid'])
-def set_cid(message: Message):
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        bot.reply_to(message, "Использование: /cid 123456")
-        return
-
-    cid = parts[1].strip()
-    user_id = message.from_user.id
-
-    users_collection.update_one(
-        {"user_id": user_id},
-        {"$set": {"cid": cid}},
-        upsert=True
-    )
-
-    bot.reply_to(message, f"VATSIM CID сохранён: {cid}")
-
-
-@bot.message_handler(commands=['metar'])
-def metar_handler(message: Message):
-    parts = message.text.split()
-    if len(parts) < 2:
-        bot.reply_to(message, "Использование: /metar UUEE")
-        return
-
-    icao = parts[1].upper()
-    if len(icao) != 4:
-        bot.reply_to(message, "ICAO должен быть 4 буквы")
-        return
-
-    metar, taf = get_metar_taf(icao)
-
-    txt = (f"<b>{icao}</b>\n"
-           f"METAR: {metar}\n"
-           f"Расшифровка METAR:\n{decode_metar(metar)}")
-
-    markup = get_normal_refresh_markup(icao)
-
-    sent = bot.reply_to(message, txt, parse_mode='HTML', reply_markup=markup)
-    last_data[sent.message_id] = metar + taf
-
-
-@bot.message_handler(commands=['weather'])
-def weather_handler(message: Message):
-    parts = message.text.split()
-    user_id = message.from_user.id
-
-    if len(parts) >= 2:
-        icao = parts[1].upper()
-        if len(icao) != 4:
-            bot.reply_to(message, "ICAO должен быть 4 символа")
-            return
-
-        metar, taf = get_metar_taf(icao)
-
-        txt = (f"<b>{icao}</b>\n"
-               f"METAR: {metar}\n"
-               f"Расшифровка METAR:\n{decode_metar(metar)}\n\n"
-               f"{get_taf_text(taf)}")
-
-        markup = get_normal_refresh_markup(icao)
-
-        sent = bot.reply_to(message, txt, parse_mode='HTML', reply_markup=markup)
-        last_data[sent.message_id] = metar + taf
-
-    else:
-        # Без ICAO — показываем пагинацию
-        user_pages[user_id] = 0
-        show_weather_page(message, user_id)
-
-
-@bot.message_handler(commands=['flight'])
-def flight_handler(message: Message):
-    user_id = message.from_user.id
-    user_doc = users_collection.find_one({"user_id": user_id})
-    cid = user_doc.get("cid") if user_doc else None
-
-    if not cid:
-        bot.reply_to(message, "Сначала выполните /cid <ваш_CID>")
-        return
-
-    airports = get_vatsim_airports(cid)
-    if not airports:
-        bot.reply_to(message, "План полёта не найден или вы не онлайн на VATSIM")
-        return
-
-    markup = InlineKeyboardMarkup()
-    row = []
-    for ap in airports[:2]:  # показываем максимум 2 кнопки
-        row.append(InlineKeyboardButton(ap, callback_data=f"apt_{ap}"))
-    markup.row(*row)
-
-    bot.reply_to(message, f"Аэропорты из вашего плана VATSIM (CID {cid}):", reply_markup=markup)
-
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('apt_'))
-def apt_handler(call: CallbackQuery):
-    icao = call.data[len('apt_'):].upper()
-
-    metar, taf = get_metar_taf(icao)
-
-    text = (f"<b>{icao}</b>\n"
-            f"METAR: {metar}\n"
-            f"Расшифровка METAR:\n{decode_metar(metar)}\n\n"
-            f"{get_taf_text(taf)}")
-
-    markup = get_flight_markup(icao)
-
-    bot.edit_message_text(
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
-        text=text,
-        parse_mode='HTML',
-        reply_markup=markup
-    )
-
-    last_data[call.message.message_id] = metar + taf
-
-
-@bot.callback_query_handler(func=lambda call: call.data == "back_to_flight")
-def back_to_flight_handler(call: CallbackQuery):
-    user_id = call.from_user.id
-    user_doc = users_collection.find_one({"user_id": user_id})
-    cid = user_doc.get("cid") if user_doc else None
-
-    if not cid:
-        bot.answer_callback_query(call.id, "CID не установлен")
-        return
-
-    airports = get_vatsim_airports(cid)
-    if not airports:
-        bot.answer_callback_query(call.id, "План полёта не найден")
-        return
-
-    text = f"Аэропорты из вашего плана VATSIM (CID {cid}):"
-    markup = InlineKeyboardMarkup()
-    row = []
-    for ap in airports[:2]:
-        row.append(InlineKeyboardButton(ap, callback_data=f"apt_{ap}"))
-    markup.row(*row)
-
-    bot.edit_message_text(
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
-        text=text,
-        parse_mode='HTML',
-        reply_markup=markup
-    )
-
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('page_'))
-def page_handler(call: CallbackQuery):
-    user_id = call.from_user.id
-    new_page = int(call.data.split('_')[1])
-    user_pages[user_id] = new_page
-    show_weather_page(call, user_id, edit=True)
-
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('refresh_'))
-def refresh_handler(call: CallbackQuery):
-    prefix = 'refresh_normal_' if call.data.startswith('refresh_normal_') else 'refresh_flight_'
-    icao = call.data[len(prefix):].upper()
-    from_flight = prefix == 'refresh_flight_'
-
-    metar, taf = get_metar_taf(icao)
-    new_data = metar + taf
-
-    message_id = call.message.message_id
-    previous_data = last_data.get(message_id)
-
-    if previous_data == new_data:
-        bot.answer_callback_query(call.id, "Данные и так актуальны", show_alert=False)
-        return
-
-    text = (f"<b>{icao}</b>\n"
-            f"METAR: {metar}\n"
-            f"Расшифровка METAR:\n{decode_metar(metar)}\n\n"
-            f"{get_taf_text(taf)}")
-
-    markup = get_flight_markup(icao) if from_flight else get_normal_refresh_markup(icao)
-
-    bot.edit_message_text(
-        chat_id=call.message.chat.id,
-        message_id=message_id,
-        text=text,
-        parse_mode='HTML',
-        reply_markup=markup
-    )
-
-    last_data[message_id] = new_data
-    bot.answer_callback_query(call.id, "Данные обновлены!")
 
 
 def get_normal_refresh_markup(icao: str):
