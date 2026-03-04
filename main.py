@@ -1,8 +1,3 @@
-# Полный рабочий код Telegram-бота METAR/TAF с MongoDB и webhook для Render.com
-# Переменные BOT_TOKEN и MONGODB_URI берутся из переменных окружения
-# Кнопка "Обновить" сравнивает данные: если не изменились — уведомление "Данные и так актуальны"
-# TAF выводится только сырым текстом (расшифровка убрана)
-
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import telebot
 import requests
@@ -12,28 +7,23 @@ import pymongo
 import os
 from flask import Flask, request, abort
 
-# Токен бота и URI MongoDB берутся из переменных окружения (для Render)
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 MONGODB_URI = os.environ.get('MONGODB_URI')
 
-# Проверка, что переменные установлены
 if not BOT_TOKEN:
     raise ValueError("Переменная окружения BOT_TOKEN не установлена!")
 if not MONGODB_URI:
     raise ValueError("Переменная окружения MONGODB_URI не установлена!")
 
-# Подключение к MongoDB
 client = pymongo.MongoClient(MONGODB_URI)
 db = client['bot_db']
 users_collection = db['users']
 
-# Файл с аэропортами (OurAirports)
 AIRPORTS_CSV = 'airports.csv'
 AIRPORTS_LIST = []
 
 
 def load_airports():
-    """Загрузка списка крупных и средних аэропортов из CSV"""
     global AIRPORTS_LIST
     try:
         with open(AIRPORTS_CSV, encoding='utf-8') as f:
@@ -51,19 +41,14 @@ def load_airports():
 
 load_airports()
 
-# Создаём бота
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# Хранилище страниц пагинации
 user_pages = {}
 
-# Словарь для хранения последних данных по message_id (чтобы сравнивать при обновлении)
 last_data = {}  # key: message_id, value: (metar_raw + taf_raw)
 
 
-# Получение METAR и TAF (с заголовками для обхода кэша)
 def get_metar_taf(icao: str):
-    """Получение свежих METAR и TAF"""
     try:
         headers = {'Cache-Control': 'no-cache', 'Pragma': 'no-cache'}
         metar_url = f"https://aviationweather.gov/api/data/metar?ids={icao}&format=json"
@@ -81,9 +66,7 @@ def get_metar_taf(icao: str):
         return f"Ошибка: {str(e)}", ""
 
 
-# Расшифровка METAR (полная)
 def decode_metar(metar: str):
-    """Расшифровка METAR на русский"""
     if not metar or "не найден" in metar or "Ошибка" in metar:
         return "Расшифровка недоступна"
 
@@ -198,15 +181,12 @@ def decode_metar(metar: str):
 
     return "\n".join(decoded)
 
-
-# TAF — только сырой текст
 def get_taf_text(taf: str):
     if "не найден" in taf or "Ошибка" in taf:
         return "TAF не найден"
     return f"TAF: {taf}"
 
 
-# Получение аэропортов из VATSIM
 def get_vatsim_airports(cid: str):
     try:
         url = "https://data.vatsim.net/v3/vatsim-data.json"
@@ -231,7 +211,6 @@ def get_vatsim_airports(cid: str):
         return []
 
 
-# Клавиатуры
 def get_normal_refresh_markup(icao: str):
     markup = InlineKeyboardMarkup()
     markup.row(InlineKeyboardButton("🔄 Обновить", callback_data=f"refresh_normal_{icao}"))
@@ -245,7 +224,6 @@ def get_flight_markup(icao: str):
     return markup
 
 
-# Пагинация списка аэропортов
 def show_weather_page(msg_or_call, user_id, edit=False):
     page = user_pages.get(user_id, 0)
     per_page = 10
@@ -283,7 +261,6 @@ def show_weather_page(msg_or_call, user_id, edit=False):
         bot.send_message(msg_or_call.chat.id, text, parse_mode='HTML', reply_markup=markup)
 
 
-# Обработчики команд
 @bot.message_handler(commands=['start'])
 def start(message: Message):
     bot.reply_to(message, "Привет! Бот METAR/TAF.\n"
@@ -355,7 +332,6 @@ def page_handler(call: CallbackQuery):
     show_weather_page(call, user_id, edit=True)
 
 
-# Универсальный обработчик "Обновить" (для всех случаев)
 @bot.callback_query_handler(func=lambda call: call.data.startswith('refresh_'))
 def refresh_handler(call: CallbackQuery):
     prefix = 'refresh_normal_' if call.data.startswith('refresh_normal_') else 'refresh_flight_'
@@ -372,7 +348,6 @@ def refresh_handler(call: CallbackQuery):
         bot.answer_callback_query(call.id, "Данные и так актуальны", show_alert=False)
         return
 
-    # Данные изменились — обновляем
     text = (f"<b>{icao}</b>\n"
             f"METAR: {metar}\n"
             f"Расшифровка METAR:\n{decode_metar(metar)}\n\n"
@@ -384,7 +359,6 @@ def refresh_handler(call: CallbackQuery):
                           message_id=message_id,
                           text=text, parse_mode='HTML', reply_markup=markup)
 
-    # Сохраняем новые данные
     last_data[message_id] = new_data
 
     bot.answer_callback_query(call.id, "Данные обновлены!")
@@ -427,7 +401,6 @@ def apt_handler(call: CallbackQuery):
                           message_id=call.message.message_id,
                           text=text, parse_mode='HTML', reply_markup=markup)
 
-    # Сохраняем данные
     last_data[call.message.message_id] = metar + taf
 
 
@@ -456,7 +429,6 @@ def back_to_flight_handler(call: CallbackQuery):
                           text=text, parse_mode='HTML', reply_markup=markup)
 
 
-# Webhook для Render
 app = Flask(__name__)
 
 
