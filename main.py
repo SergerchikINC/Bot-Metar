@@ -6,14 +6,24 @@ from telebot.types import Message, CallbackQuery
 import pymongo
 import os
 from flask import Flask, request, abort
+from groq import Groq
+import json
+import logging
+import datetime
+
+logging.basicConfig(
+    filename='groq_logs.txt',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    encoding='utf-8'
+)
 
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 MONGODB_URI = os.environ.get('MONGODB_URI')
+GROQ_API_KEY = os.environ.get('GROQ_API_KEY')
 
-if not BOT_TOKEN:
-    raise ValueError("Переменная окружения BOT_TOKEN не установлена!")
-if not MONGODB_URI:
-    raise ValueError("Переменная окружения MONGODB_URI не установлена!")
+if not BOT_TOKEN or not MONGODB_URI or not GROQ_API_KEY:
+    raise ValueError("Не все переменные окружения установлены! BOT_TOKEN, MONGODB_URI, GROQ_API_KEY")
 
 client = pymongo.MongoClient(MONGODB_URI)
 db = client['bot_db']
@@ -42,10 +52,119 @@ def load_airports():
 load_airports()
 
 bot = telebot.TeleBot(BOT_TOKEN)
+groq_client = Groq(api_key=GROQ_API_KEY)
 
 user_pages = {}
+last_data = {}
 
-last_data = {}  # key: message_id, value: (metar_raw + taf_raw)
+
+def parse_user_request(text: str):
+    prompt = f"""Ты эксперт по авиации, знаешь все коды аэропортов мира.
+Из сообщения пользователя извлеки:
+- ICAO-код аэропорта (ровно 4 заглавные буквы, например UUEE, ULLI, KJFK).
+  Если написано название города, аэропорта или IATA (3 буквы) — обязательно конвертируй в ICAO.
+  Примеры:
+  - Пулково, Санкт-Петербург, LED → ULLI
+  - Шереметьево, SVO → UUEE
+  - Домодедово, DME → UUDD
+  - JFK, Нью-Йорк → KJFK
+  - Хитроу, Лондон → EGLL
+  - Сочи → URSS
+- Что именно нужно: METAR, TAF или BOTH.
+  Если просто "погода", "какая погода", "что в аэропорту", "погода в ..." — BOTH.
+  Если явно "METAR", "метар" — METAR.
+  Если "TAF", "прогноз" — TAF.
+
+Ответь **строго только JSON**, без лишних слов и переносов строк:
+{{"icao": "ULLI", "type": "METAR"|"TAF"|"BOTH"}}
+
+Если не можешь определить — верни "icao": "UNKNOWN"
+
+Сообщение пользователя: {text}"""
+
+    logging.info(f"Запрос к Groq: {text}")
+
+    try:
+        response = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=150
+        )
+        answer = response.choices[0].message.content.strip()
+        logging.info(f"Ответ от Groq: {answer}")
+
+        result = json.loads(answer)
+        return result
+    except Exception as e:
+        logging.error(f"Ошибка парсинга Groq: {str(e)}")
+        return None
+
+
+def recognize_voice(file_id):
+    try:
+        file_info = bot.get_file(file_id)
+        downloaded = bot.download_file(file_info.file_path)
+
+        with open("voice.ogg", "wb") as f:
+            f.write(downloaded)
+
+        with open("voice.ogg", "rb") as audio:
+            transcription = groq_client.audio.transcriptions.create(
+                model="whisper-large-v3",
+                file=audio,
+                response_format="text",
+                language="ru",
+                temperature=0.0,
+                prompt="Погода, METAR, TAF, аэропорты: Пулково, Шереметьево, Домодедово, Внуково, LED, ULLI, UUEE, UUDD, UUWW, Санкт-Петербург, Москва"
+            )
+
+        os.remove("voice.ogg")
+        return transcription.strip()
+    except Exception as e:
+        logging.error(f"Ошибка распознавания голоса: {e}")
+        return None
+
+
+@bot.message_handler(content_types=['text', 'voice'])
+def handle_natural_language(message: Message):
+    if message.text and message.text.startswith('/'):
+        return
+
+    if message.voice:
+        text = recognize_voice(message.voice.file_id)
+        if not text:
+            bot.reply_to(message, "Не удалось распознать голосовое сообщение.")
+            return
+        bot.reply_to(message, f"🎤 Распознаю голосовое, ожидайте ответ")
+    else:
+        text = message.text.strip()
+
+    if not text:
+        return
+
+    result = parse_user_request(text)
+    if not result or result.get("icao") == "UNKNOWN":
+        bot.reply_to(message, "Не понял запрос. Примеры:\n• Погода в Пулково\n• METAR LED\n• Что в Шереметьево")
+        return
+
+    icao = result["icao"].upper()
+    req_type = result.get("type", "BOTH").upper()
+
+    metar, taf = get_metar_taf(icao)
+
+    if req_type == "METAR":
+        txt = f"<b>{icao}</b>\nMETAR: {metar}\nРасшифровка:\n{decode_metar(metar)}"
+        markup = get_normal_refresh_markup(icao)
+    elif req_type == "TAF":
+        txt = f"<b>{icao}</b>\n{get_taf_text(taf)}"
+        markup = get_normal_refresh_markup(icao)
+    else:
+        txt = f"<b>{icao}</b>\nMETAR: {metar}\nРасшифровка:\n{decode_metar(metar)}\n\n{get_taf_text(taf)}"
+        markup = get_normal_refresh_markup(icao)
+
+    sent = bot.reply_to(message, txt, parse_mode='HTML', reply_markup=markup)
+    last_data[sent.message_id] = metar + taf
 
 
 def get_metar_taf(icao: str):
@@ -53,17 +172,21 @@ def get_metar_taf(icao: str):
         headers = {'Cache-Control': 'no-cache', 'Pragma': 'no-cache'}
         metar_url = f"https://aviationweather.gov/api/data/metar?ids={icao}&format=json"
         metar_resp = requests.get(metar_url, timeout=15, headers=headers)
-        metar_raw = metar_resp.json()[0].get('rawOb',
-                                             'METAR не найден') if metar_resp.status_code == 200 and metar_resp.json() else "METAR не найден"
+        metar_data = metar_resp.json()
+        metar = metar_data[0].get('rawOb', 'METAR не найден') if metar_data and isinstance(metar_data, list) and len(
+            metar_data) > 0 else "METAR не найден"
 
         taf_url = f"https://aviationweather.gov/api/data/taf?ids={icao}&format=json"
         taf_resp = requests.get(taf_url, timeout=15, headers=headers)
-        taf_raw = taf_resp.json()[0].get('rawTAF',
-                                         'TAF не найден') if taf_resp.status_code == 200 and taf_resp.json() else "TAF не найден"
+        taf_data = taf_resp.json()
+        taf = taf_data[0].get('rawTAF', 'TAF не найден') if taf_data and isinstance(taf_data, list) and len(
+            taf_data) > 0 else "TAF не найден"
 
-        return metar_raw, taf_raw
+        logging.info(f"Получены данные для {icao}: METAR={metar[:50]}..., TAF={taf[:50]}...")
+        return metar, taf
     except Exception as e:
-        return f"Ошибка: {str(e)}", ""
+        logging.error(f"Ошибка получения данных для {icao}: {str(e)}")
+        return f"Ошибка получения данных: {str(e)}", "TAF не найден"
 
 
 def decode_metar(metar: str):
@@ -181,10 +304,187 @@ def decode_metar(metar: str):
 
     return "\n".join(decoded)
 
+
+def decode_taf(taf: str):
+    if not taf or "не найден" in taf or "Ошибка" in taf:
+        return "Расшифровка TAF недоступна"
+
+    parts = taf.split()
+    decoded = []
+    i = 0
+
+    if i < len(parts) and parts[i] in ['TAF', 'AMD', 'COR']:
+        i += 1
+
+    if i >= len(parts):
+        return "Расшифровка TAF недоступна"
+    decoded.append(f"Аэропорт: {parts[i]}")
+    i += 1
+
+    if i < len(parts) and len(parts[i]) == 7 and parts[i].endswith('Z'):
+        issue_day = parts[i][:2]
+        issue_time = parts[i][2:4] + ':' + parts[i][4:6]
+        decoded.append(f"Время выдачи: {issue_day}-е число, {issue_time} UTC")
+        i += 1
+
+
+    if i < len(parts) and len(parts[i]) == 5 and parts[i].isdigit():
+        start_day = parts[i][:2]
+        start_time = parts[i][2:4] + ':' + parts[i][4:5] + '0'
+        end_day = parts[i][5:7]
+        end_time = parts[i][7:9] + ':' + parts[i][9:10] + '0'
+        decoded.append(f"Период действия: с {start_day}-е {start_time} UTC по {end_day}-е {end_time} UTC")
+        i += 1
+
+    while i < len(parts) and not parts[i].startswith('TX') and not parts[i].startswith('TN') and not parts[
+        i].startswith('TEMPO') and not parts[i].startswith('BECMG') and not parts[i].startswith('FM'):
+        if parts[i].endswith('KT') or parts[i].endswith('MPS') or 'G' in parts[i]:
+            wind = parts[i]
+            direction = wind[:3]
+            if 'G' in wind:
+                speed = wind[3:wind.index('G')]
+                gust = wind[wind.index('G') + 1:wind.index('KT' if 'KT' in wind else 'MPS')]
+            else:
+                speed = wind[3:wind.index('KT' if 'KT' in wind else 'MPS')]
+                gust = ''
+            unit = 'узлов' if 'KT' in wind else 'м/с'
+            wind_str = f"Ветер: {direction}° {speed} {unit}"
+            if gust:
+                wind_str += f", порывы {gust} {unit}"
+            decoded.append(wind_str)
+            i += 1
+
+        elif parts[i].isdigit() or parts[i] == 'CAVOK':
+            if parts[i] == 'CAVOK':
+                decoded.append("Видимость: CAVOK (≥10 км, без значимой погоды и облачности)")
+            else:
+                decoded.append(f"Видимость: {parts[i]} метров")
+            i += 1
+
+        elif parts[i].startswith('-') or parts[i].startswith('+') or parts[i] in ['RA', 'SN', 'DZ', 'BR', 'FG', 'SHRA',
+                                                                                  'TSRA', 'SH', 'TS', 'SHSN']:
+            weather = parts[i]
+            intensity = ''
+            if weather.startswith('-'):
+                intensity = 'слабый '
+                weather = weather[1:]
+            elif weather.startswith('+'):
+                intensity = 'сильный '
+                weather = weather[1:]
+
+            weather_dict = {
+                'RA': 'дождь', 'SN': 'снег', 'DZ': 'морось', 'SH': 'ливневый', 'TS': 'гроза',
+                'BR': 'дымка', 'FG': 'туман', 'SHSN': 'ливневый снег'
+            }
+            desc = weather_dict.get(weather, weather)
+            decoded.append(f"Погода: {intensity}{desc}")
+            i += 1
+
+        elif len(parts[i]) == 6 and parts[i][:3] in ['FEW', 'SCT', 'BKN', 'OVC']:
+            level_dict = {'FEW': 'мало', 'SCT': 'рассеянная', 'BKN': 'значительная', 'OVC': 'сплошная'}
+            level = level_dict[parts[i][:3]]
+            height = int(parts[i][3:]) * 100
+            decoded.append(f"Облачность: {level} на {height} футов")
+            i += 1
+
+        else:
+            i += 1
+
+    while i < len(parts) and (parts[i].startswith('TX') or parts[i].startswith('TN')):
+        if parts[i].startswith('TX'):
+            temp = parts[i][2:parts[i].index('/')]
+            time_str = parts[i].split('/')[1][:-1]
+            decoded.append(f"Макс. температура: {temp}°C в {time_str}")
+            i += 1
+        elif parts[i].startswith('TN'):
+            temp = parts[i][2:parts[i].index('/')]
+            time_str = parts[i].split('/')[1][:-1]
+            decoded.append(f"Мин. температура: {temp}°C в {time_str}")
+            i += 1
+
+    while i < len(parts):
+        if parts[i].startswith('TEMPO'):
+            decoded.append("Временно (TEMPO):")
+            i += 1
+        elif parts[i].startswith('BECMG'):
+            decoded.append("Постепенно изменяется (BECMG):")
+            i += 1
+        elif parts[i].startswith('FM'):
+            fm_time = parts[i][2:4] + ':' + parts[i][4:6]
+            decoded.append(f"С {fm_time} UTC:")
+            i += 1
+
+        while i < len(parts) and not parts[i].startswith('TEMPO') and not parts[i].startswith('BECMG') and not parts[
+            i].startswith('FM'):
+            if parts[i].endswith('KT') or parts[i].endswith('MPS') or 'G' in parts[i]:
+                wind = parts[i]
+                direction = wind[:3]
+                if 'G' in wind:
+                    speed = wind[3:wind.index('G')]
+                    gust = wind[wind.index('G') + 1:wind.index('KT' if 'KT' in wind else 'MPS')]
+                else:
+                    speed = wind[3:wind.index('KT' if 'KT' in wind else 'MPS')]
+                    gust = ''
+                unit = 'узлов' if 'KT' in wind else 'м/с'
+                wind_str = f"Ветер: {direction}° {speed} {unit}"
+                if gust:
+                    wind_str += f", порывы {gust} {unit}"
+                decoded.append(wind_str)
+                i += 1
+
+            elif parts[i].isdigit() or parts[i] == 'CAVOK':
+                if parts[i] == 'CAVOK':
+                    decoded.append("Видимость: CAVOK (≥10 км, без значимой погоды и облачности)")
+                else:
+                    decoded.append(f"Видимость: {parts[i]} метров")
+                i += 1
+
+            elif parts[i].startswith('-') or parts[i].startswith('+') or parts[i] in ['RA', 'SN', 'DZ', 'BR', 'FG',
+                                                                                      'SHRA', 'TSRA', 'SH', 'TS',
+                                                                                      'SHSN']:
+                weather = parts[i]
+                intensity = ''
+                if weather.startswith('-'):
+                    intensity = 'слабый '
+                    weather = weather[1:]
+                elif weather.startswith('+'):
+                    intensity = 'сильный '
+                    weather = weather[1:]
+
+                weather_dict = {
+                    'RA': 'дождь', 'SN': 'снег', 'DZ': 'морось', 'SH': 'ливневый', 'TS': 'гроза',
+                    'BR': 'дымка', 'FG': 'туман', 'SHSN': 'ливневый снег'
+                }
+                desc = weather_dict.get(weather, weather)
+                decoded.append(f"Погода: {intensity}{desc}")
+                i += 1
+
+            elif len(parts[i]) == 6 and parts[i][:3] in ['FEW', 'SCT', 'BKN', 'OVC']:
+                level_dict = {'FEW': 'мало', 'SCT': 'рассеянная', 'BKN': 'значительная', 'OVC': 'сплошная'}
+                level = level_dict[parts[i][:3]]
+                height = int(parts[i][3:]) * 100
+                decoded.append(f"Облачность: {level} на {height} футов")
+                i += 1
+
+            elif parts[i] == 'NSW':
+                decoded.append("Погода: NSW (без значимых явлений)")
+                i += 1
+
+            if parts[i - 1].endswith('CB'):
+                decoded[-1] += " CB (кучево-дождевые)"
+
+            else:
+                i += 1
+
+    return "\n".join(decoded)
+
+
 def get_taf_text(taf: str):
     if "не найден" in taf or "Ошибка" in taf:
         return "TAF не найден"
-    return f"TAF: {taf}"
+
+    decoded = decode_taf(taf)
+    return f"TAF (сырой): {taf}\n\nРасшифровка TAF:\n{decoded}"
 
 
 def get_vatsim_airports(cid: str):
@@ -263,11 +563,16 @@ def show_weather_page(msg_or_call, user_id, edit=False):
 
 @bot.message_handler(commands=['start'])
 def start(message: Message):
-    bot.reply_to(message, "Привет! Бот METAR/TAF.\n"
+    bot.reply_to(message, "Привет! Я бот METAR/TAF.\n"
+                          "Пиши просто текстом или отправляй голосовое:\n"
+                          "• Погода в Пулково\n"
+                          "• METAR LED\n"
+                          "• Что в Шереметьево\n\n"
+                          "Команды:\n"
                           "/cid <CID> — привязка VATSIM\n"
-                          "/weather [ICAO] — список или конкретный\n"
+                          "/flight — аэропорты из плана\n"
                           "/metar <ICAO> — конкретный аэропорт\n"
-                          "/flight — аэропорты из плана VATSIM")
+                          "/weather [ICAO] — список или конкретный")
 
 
 @bot.message_handler(commands=['cid'])
@@ -282,6 +587,23 @@ def set_cid(message: Message):
     bot.reply_to(message, f"CID сохранён: {cid}")
 
 
+@bot.message_handler(commands=['metar'])
+def metar_handler(message: Message):
+    parts = message.text.split()
+    if len(parts) < 2:
+        bot.reply_to(message, "Использование: /metar UUEE")
+        return
+    icao = parts[1].upper()
+    if len(icao) != 4:
+        bot.reply_to(message, "ICAO должен быть 4 буквы")
+        return
+    metar, taf = get_metar_taf(icao)
+    txt = f"<b>{icao}</b>\nMETAR: {metar}\nРасшифровка:\n{decode_metar(metar)}\n\n{get_taf_text(taf)}"
+    markup = get_normal_refresh_markup(icao)
+    sent = bot.reply_to(message, txt, parse_mode='HTML', reply_markup=markup)
+    last_data[sent.message_id] = metar + taf
+
+
 @bot.message_handler(commands=['weather'])
 def weather_handler(message: Message):
     parts = message.text.split()
@@ -292,76 +614,13 @@ def weather_handler(message: Message):
             bot.reply_to(message, "ICAO должен быть 4 символа")
             return
         metar, taf = get_metar_taf(icao)
-        response = (f"<b>{icao}</b>\n"
-                    f"METAR: {metar}\n"
-                    f"Расшифровка METAR:\n{decode_metar(metar)}\n\n"
-                    f"{get_taf_text(taf)}")
+        txt = f"<b>{icao}</b>\nMETAR: {metar}\nРасшифровка:\n{decode_metar(metar)}\n\n{get_taf_text(taf)}"
         markup = get_normal_refresh_markup(icao)
-        sent = bot.reply_to(message, response, parse_mode='HTML', reply_markup=markup)
-        last_data[sent.message_id] = metar + taf  # Сохраняем данные
+        sent = bot.reply_to(message, txt, parse_mode='HTML', reply_markup=markup)
+        last_data[sent.message_id] = metar + taf
     else:
         user_pages[user_id] = 0
         show_weather_page(message, user_id)
-
-
-@bot.message_handler(commands=['metar'])
-def metar_handler(message: Message):
-    parts = message.text.split()
-    if len(parts) < 2:
-        bot.reply_to(message, "Использование: /metar UUEE")
-        return
-    icao = parts[1].upper()
-    if len(icao) != 4:
-        bot.reply_to(message, "ICAO — 4 буквы")
-        return
-    metar, taf = get_metar_taf(icao)
-    response = (f"<b>{icao}</b>\n"
-                f"METAR: {metar}\n"
-                f"Расшифровка METAR:\n{decode_metar(metar)}\n\n"
-                f"{get_taf_text(taf)}")
-    markup = get_normal_refresh_markup(icao)
-    sent = bot.reply_to(message, response, parse_mode='HTML', reply_markup=markup)
-    last_data[sent.message_id] = metar + taf  # Сохраняем данные
-
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('page_'))
-def page_handler(call: CallbackQuery):
-    user_id = call.from_user.id
-    new_page = int(call.data.split('_')[1])
-    user_pages[user_id] = new_page
-    show_weather_page(call, user_id, edit=True)
-
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('refresh_'))
-def refresh_handler(call: CallbackQuery):
-    prefix = 'refresh_normal_' if call.data.startswith('refresh_normal_') else 'refresh_flight_'
-    icao = call.data[len(prefix):].upper()
-    from_flight = prefix == 'refresh_flight_'
-
-    metar, taf = get_metar_taf(icao)
-    new_data = metar + taf
-
-    message_id = call.message.message_id
-    previous_data = last_data.get(message_id)
-
-    if previous_data == new_data:
-        bot.answer_callback_query(call.id, "Данные и так актуальны", show_alert=False)
-        return
-
-    text = (f"<b>{icao}</b>\n"
-            f"METAR: {metar}\n"
-            f"Расшифровка METAR:\n{decode_metar(metar)}\n\n"
-            f"{get_taf_text(taf)}")
-
-    markup = get_flight_markup(icao) if from_flight else get_normal_refresh_markup(icao)
-
-    bot.edit_message_text(chat_id=call.message.chat.id,
-                          message_id=message_id,
-                          text=text, parse_mode='HTML', reply_markup=markup)
-
-    last_data[message_id] = new_data
-
-    bot.answer_callback_query(call.id, "Данные обновлены!")
 
 
 @bot.message_handler(commands=['flight'])
@@ -390,18 +649,47 @@ def flight_handler(message: Message):
 def apt_handler(call: CallbackQuery):
     icao = call.data[len('apt_'):].upper()
     metar, taf = get_metar_taf(icao)
-    text = (f"<b>{icao}</b>\n"
-            f"METAR: {metar}\n"
-            f"Расшифровка METAR:\n{decode_metar(metar)}\n\n"
-            f"{get_taf_text(taf)}")
-
+    text = f"<b>{icao}</b>\nMETAR: {metar}\nРасшифровка:\n{decode_metar(metar)}\n\n{get_taf_text(taf)}"
     markup = get_flight_markup(icao)
+    bot.edit_message_text(chat_id=call.message.chat.id,
+                          message_id=call.message.message_id,
+                          text=text, parse_mode='HTML', reply_markup=markup)
+    last_data[call.message.message_id] = metar + taf
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('page_'))
+def page_handler(call: CallbackQuery):
+    user_id = call.from_user.id
+    new_page = int(call.data.split('_')[1])
+    user_pages[user_id] = new_page
+    show_weather_page(call, user_id, edit=True)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('refresh_'))
+def refresh_handler(call: CallbackQuery):
+    prefix = 'refresh_normal_' if call.data.startswith('refresh_normal_') else 'refresh_flight_'
+    icao = call.data[len(prefix):].upper()
+    from_flight = prefix == 'refresh_flight_'
+
+    metar, taf = get_metar_taf(icao)
+    new_data = metar + taf
+
+    message_id = call.message.message_id
+    previous_data = last_data.get(message_id)
+
+    if previous_data == new_data:
+        bot.answer_callback_query(call.id, "Данные и так актуальны", show_alert=False)
+        return
+
+    text = f"<b>{icao}</b>\nMETAR: {metar}\nРасшифровка:\n{decode_metar(metar)}\n\n{get_taf_text(taf)}"
+    markup = get_flight_markup(icao) if from_flight else get_normal_refresh_markup(icao)
 
     bot.edit_message_text(chat_id=call.message.chat.id,
                           message_id=call.message.message_id,
                           text=text, parse_mode='HTML', reply_markup=markup)
 
-    last_data[call.message.message_id] = metar + taf
+    last_data[message_id] = new_data
+    bot.answer_callback_query(call.id, "Данные обновлены!")
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "back_to_flight")
@@ -449,11 +737,25 @@ def index():
 
 
 if __name__ == '__main__':
+    try:
+        bot.delete_webhook(drop_pending_updates=True)
+        logging.info("Старый webhook удалён")
+    except Exception as e:
+        logging.warning(f"Не удалось удалить webhook: {e}")
+
     if os.environ.get('RENDER') is None:
-        bot.infinity_polling(none_stop=True)
+        logging.info("Запуск в режиме polling")
+        bot.infinity_polling(none_stop=True, timeout=30)
     else:
-        bot.remove_webhook()
         url = f"https://{os.environ.get('RENDER_EXTERNAL_HOSTNAME')}"
-        bot.set_webhook(url=f"{url}/{BOT_TOKEN}")
+        webhook_url = f"{url}/{BOT_TOKEN}"
+        logging.info(f"Установка webhook на {webhook_url}")
+
+        try:
+            bot.set_webhook(url=webhook_url)
+            logging.info("Webhook успешно установлен")
+        except Exception as e:
+            logging.error(f"Ошибка установки webhook: {e}")
+
         port = int(os.environ.get('PORT', 5000))
-        app.run(host='0.0.0.0', port=port)
+        app.run(host='0.0.0.0', port=port, debug=False)
