@@ -22,10 +22,6 @@ BOT_TOKEN = os.environ.get('BOT_TOKEN')
 MONGODB_URI = os.environ.get('MONGODB_URI')
 GROQ_API_KEY = os.environ.get('GROQ_API_KEY')
 
-'''BOT_TOKEN = '7947527517:AAFfeVZot_s9Zdd-H8QDuVFVGnE6itM4Rlw'
-MONGODB_URI = 'mongodb+srv://Ger1k:Sergerchik_Men847@cluster0.4u1ctex.mongodb.net/?appName=Cluster0'
-GROQ_API_KEY = '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' '''
-
 if not BOT_TOKEN or not MONGODB_URI or not GROQ_API_KEY:
     raise ValueError("Не все переменные окружения установлены! BOT_TOKEN, MONGODB_URI, GROQ_API_KEY")
 
